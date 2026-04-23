@@ -197,29 +197,55 @@ export const getProviderHealth = (_req, res) => {
 export const getQuickStock = async (req, res) => {
   try {
     const symbol = (req.params.symbol || "").toUpperCase().trim();
+
     if (!symbol) {
       return res.status(400).json({ error: "Stock symbol is required." });
     }
 
-    // 🔹 Use existing lightweight live stock function (FAST)
-    const live = await getLiveStockData(symbol);
+    // ✅ Handle index symbols
+    let finalSymbol = symbol;
 
-    if (!live || live.price == null) {
-      return res.status(404).json({ error: "Invalid or unsupported stock symbol." });
+    if (symbol.startsWith("^")) {
+      const map = {
+        "^NSEI": "NIFTY50.NS",
+        "^NSEBANK": "BANKNIFTY.NS",
+        "^BSESN": "SENSEX.NS"
+      };
+      finalSymbol = map[symbol] || symbol;
     }
 
-    const currentPrice  = Number(live.price);
-    const prevClose     = Number(live.prevClose || currentPrice);
+    // ✅ Fetch live data safely
+    let live;
+    try {
+      live = await getLiveStockData(finalSymbol);
+    } catch (err) {
+      console.warn(`Quick API fetch failed for ${finalSymbol}:`, err.message);
+      return res.status(404).json({
+        error: "Stock data not available",
+        symbol,
+      });
+    }
 
-    const change        = +(currentPrice - prevClose).toFixed(2);
+    // ✅ Validate response
+    if (!live || live.price == null) {
+      return res.status(404).json({
+        error: "Invalid or unsupported stock symbol",
+        symbol,
+      });
+    }
+
+    const currentPrice = Number(live.price);
+    const prevClose = Number(live.prevClose || currentPrice);
+
+    const change = +(currentPrice - prevClose).toFixed(2);
     const changePercent = prevClose
-      ? +(((change) / prevClose) * 100).toFixed(2)
+      ? +((change / prevClose) * 100).toFixed(2)
       : 0;
 
-    const currency = symbol.endsWith(".NS") ? "INR" : "USD";
+    const currency = finalSymbol.endsWith(".NS") ? "INR" : "USD";
 
     return res.json({
-      symbol,
+      symbol, // original symbol return (important for frontend)
       price: currentPrice,
       change,
       changePercent,
