@@ -190,3 +190,48 @@ export const getLiveStock = getLiveStockData;
 export const getProviderHealth = (_req, res) => {
   return res.json(getHealthStats());
 };
+/* ════════════════════════════════════════════════════════════
+   QUICK STOCK — Lightweight Dashboard API
+   GET /api/stock/:symbol/quick
+════════════════════════════════════════════════════════════ */
+export const getQuickStock = async (req, res) => {
+  try {
+    const symbol = (req.params.symbol || "").toUpperCase().trim();
+    if (!symbol) {
+      return res.status(400).json({ error: "Stock symbol is required." });
+    }
+
+    // 🔹 Use existing lightweight live stock function (FAST)
+    const live = await getLiveStockData(symbol);
+
+    if (!live || live.price == null) {
+      return res.status(404).json({ error: "Invalid or unsupported stock symbol." });
+    }
+
+    const currentPrice  = Number(live.price);
+    const prevClose     = Number(live.prevClose || currentPrice);
+
+    const change        = +(currentPrice - prevClose).toFixed(2);
+    const changePercent = prevClose
+      ? +(((change) / prevClose) * 100).toFixed(2)
+      : 0;
+
+    const currency = symbol.endsWith(".NS") ? "INR" : "USD";
+
+    return res.json({
+      symbol,
+      price: currentPrice,
+      change,
+      changePercent,
+      currency,
+    });
+
+  } catch (err) {
+    console.error(`getQuickStock ERROR [${req?.params?.symbol}]:`, err.message);
+
+    return res.status(500).json({
+      error: "Failed to fetch quick stock data",
+      symbol: (req?.params?.symbol || "").toUpperCase(),
+    });
+  }
+};

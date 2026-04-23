@@ -14,6 +14,7 @@ import {
   getStockData,
   getBatchStockData,
   getProviderHealth,
+  getQuickStock, // ✅ NEW
 } from "../controllers/stock.controller.js";
 import { verifyToken } from "../middleware/auth.middleware.js";
 
@@ -83,7 +84,14 @@ const noCache = (_req, res, next) => {
 /* ════════════════════════════════════════════════════════════
    ROUTES
 ════════════════════════════════════════════════════════════ */
-
+// ✅ NEW QUICK API (must be before "/:symbol")
+router.get(
+  "/:symbol/quick",
+  verifyToken,
+  noCache,
+  sanitizeSymbol,
+  getQuickStock
+);
 router.get("/health",  noCache, getProviderHealth);
 router.post("/batch",  verifyToken, noCache, validateBatchBody, getBatchStockData);
 router.get("/:symbol", verifyToken, noCache, sanitizeSymbol, validateRange, getStockData);
