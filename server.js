@@ -16,6 +16,7 @@ import favoritesRoutes   from "./routes/favorites.routes.js";   // ← NEW
 import { registerSocketHandlers } from "./socket/socketManager.js";
 import newsRoutes        from "./routes/news.routes.js";  
 import aiRoutess from "./routes/ai.routes.js";
+import indicesRoutes from "./routes/indices.routes.js";
    // ← NEW
 /* ── DB ── */
 connectDB();
@@ -68,6 +69,7 @@ const apiLimiter = rateLimit({
 /* ══════════════════════════════════════════
    ROUTES
 ══════════════════════════════════════════ */
+app.use("/api/indices", apiLimiter, indicesRoutes);
 app.use("/api/auth",      authLimiter, authRoutes);
 app.use("/api/stock",     apiLimiter,  stockRoutes);
 app.use("/api/ai",        apiLimiter,  aiRoutes);
