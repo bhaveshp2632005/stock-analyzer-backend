@@ -1,10 +1,14 @@
 /**
  * providers/yahoo.js
- * Yahoo Finance provider — US + Indian stocks
+ * Yahoo Finance provider — US + Indian stocks + Index symbols
  *
  * Supports: All symbols (universal fallback)
  * Rate limit: Informal — no fixed limit but aggressive use gets blocked
  * Uses crumb authentication required since 2024
+ *
+ * Index support:
+ *   normalizeSymbol() maps ^NSEI → NIFTY50.NS before this provider is called.
+ *   We reverse-map NIFTY50.NS → ^NSEI here so Yahoo's API gets its native ticker.
  */
 
 import axios from "axios";
@@ -21,8 +25,8 @@ const getYahooCrumb = async () => {
   if (_crumbCache && _crumbCache.expiresAt > now) return _crumbCache;
 
   const cookieRes = await axios.get("https://finance.yahoo.com/", {
-    timeout:     10000,
-    headers:     { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" },
+    timeout:      10000,
+    headers:      { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" },
     maxRedirects: 5,
   });
   const cookies = (cookieRes.headers["set-cookie"] || [])
@@ -52,9 +56,23 @@ const RANGE_MAP = {
 
 const isIndian = (s) => /\.(NS|BO|NSE|BSE)$/i.test(s);
 
+/**
+ * Reverse map: normalized index symbols → Yahoo's native tickers.
+ * normalizeSymbol() converts ^NSEI → NIFTY50.NS before reaching this provider.
+ * Yahoo's API only understands ^NSEI, not NIFTY50.NS, so we translate back here.
+ */
+const NORMALIZED_TO_YAHOO = {
+  "NIFTY50.NS":   "^NSEI",
+  "BANKNIFTY.NS": "^NSEBANK",
+  "SENSEX.NS":    "^BSESN",
+};
+
 export const supports = (_symbol) => true; // universal fallback
 
 export const fetch = async (symbol, range) => {
+  // Translate normalized index symbols back to Yahoo-native tickers
+  const yahooSymbol = NORMALIZED_TO_YAHOO[symbol] ?? symbol;
+
   const { yRange, interval } = RANGE_MAP[range] || RANGE_MAP["1M"];
   let data;
   let lastErr;
@@ -66,14 +84,15 @@ export const fetch = async (symbol, range) => {
       let headers = { "User-Agent": UA, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9" };
 
       if (useCrumb) {
-        const auth    = await getYahooCrumb();
-        params.crumb  = auth.crumb;
+        const auth     = await getYahooCrumb();
+        params.crumb   = auth.crumb;
         headers.Cookie = auth.cookies;
       }
 
       for (const host of ["query1", "query2"]) {
         try {
-          const url = `https://${host}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+          // Use yahooSymbol in the URL — ^NSEI not NIFTY50.NS
+          const url = `https://${host}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`;
           const res = await axios.get(url, { params, headers, timeout: 14000 });
           data = res.data;
           if (data?.chart?.result?.[0]) break;
@@ -92,7 +111,7 @@ export const fetch = async (symbol, range) => {
   }
 
   const result = data?.chart?.result?.[0];
-  if (!result) throw new Error(lastErr?.message || `Yahoo: no data for ${symbol}`);
+  if (!result) throw new Error(lastErr?.message || `Yahoo: no data for ${yahooSymbol}`);
 
   const meta = result.meta;
   const ts   = result.timestamp || [];
@@ -107,7 +126,7 @@ export const fetch = async (symbol, range) => {
     volume: q.volume?.[i] || 0,
   })).filter(c => c.close && c.close > 0 && c.open && c.high && c.low);
 
-  if (!candles.length) throw new Error(`Yahoo: empty candles for ${symbol}`);
+  if (!candles.length) throw new Error(`Yahoo: empty candles for ${yahooSymbol}`);
 
   const last      = candles[candles.length - 1];
   const prevClose = meta.chartPreviousClose || meta.previousClose
@@ -116,7 +135,7 @@ export const fetch = async (symbol, range) => {
   const chgPct    = prevClose ? +((( price - prevClose) / prevClose) * 100).toFixed(2) : 0;
 
   return {
-    symbol,
+    symbol,          // return normalized form (e.g. NIFTY50.NS), not yahooSymbol (^NSEI)
     name:          meta.shortName || meta.longName || symbol,
     price:         +Number(price).toFixed(2),
     open:          meta.regularMarketOpen    != null ? +Number(meta.regularMarketOpen).toFixed(2)    : last.open,

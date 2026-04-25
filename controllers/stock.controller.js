@@ -1,19 +1,23 @@
 /**
  * stock.controller.js — Refactored with Multi-Provider Engine
+ * + Full Index Symbol Support (^NSEI, ^BSESN, ^NSEBANK)
  *
- * Controller is now lean:
+ * Controller flow:
  *  1. Cache check (stockCache.js)
- *  2. Call providerEngine.fetchStock() — handles all provider logic
- *  3. Attach RSI / MACD / signal indicators
- *  4. Cache the result
- *  5. Return to client
+ *  2. Normalize index symbols via normalizeSymbol()
+ *  3. Call providerEngine.fetchStock() — handles all provider logic
+ *  4. Attach RSI / MACD / EMA / signal indicators
+ *  5. Cache the result
+ *  6. Return to client with originalSymbol + type tag
  *
  * API endpoints unchanged:
  *  GET  /api/stock/:symbol?range=1M
  *  POST /api/stock/batch
+ *  GET  /api/stock/:symbol/quick
+ *  GET  /api/stock/health
  */
 
-import { calculateRSI, calculateMACD } from "../utils/indicators.js";
+import { calculateRSI, calculateMACD, emaSeries } from "../utils/indicators.js";
 import { fetchStock, getLiveStockData, getHealthStats } from "../providers/providerEngine.js";
 import {
   serverCacheGet,
@@ -21,16 +25,24 @@ import {
   serverCacheKey,
   serverCacheTTL,
 } from "./stockCache.js";
+import {
+  normalizeSymbol,
+  getSymbolType,
+  getDisplayName,
+} from "../utils/symbolNormalizer.js";
 
 /* ── Valid ranges ── */
 const VALID_RANGES = new Set(["1W", "1M", "3M", "6M", "1Y", "5Y"]);
 
-/* ── Indicator helpers ── */
-const rsiSeries  = (closes) =>
-  closes.map((_, i) => i < 14 ? null : calculateRSI(closes.slice(i - 14, i + 1)));
+/* ── EMA period ── */
+const EMA_PERIOD = 20;
+
+/* ── Indicator series helpers ── */
+const rsiSeries = (closes) =>
+  closes.map((_, i) => (i < 14 ? null : calculateRSI(closes.slice(i - 14, i + 1))));
 
 const macdSeries = (closes) =>
-  closes.map((_, i) => i < 26 ? null : calculateMACD(closes.slice(0, i + 1)));
+  closes.map((_, i) => (i < 26 ? null : calculateMACD(closes.slice(0, i + 1))));
 
 const getSignal = (rsi, macd) => {
   if (rsi == null || macd == null) return "HOLD";
@@ -44,21 +56,35 @@ const rowSig = (rsi, macd) => {
   return s === "HOLD" ? null : s;
 };
 
-/**
- * attachIndicators(engineResult) — adds RSI/MACD/signal to candles
- * Returns a fully-formed API response payload.
- */
-const attachIndicators = (data, range) => {
-  const closes     = data.candles.map(c => c.close);
+/* ════════════════════════════════════════════════════════════
+   attachIndicators
+   Attaches RSI / MACD / EMA / signal to the engine result.
+   Also stamps originalSymbol, type, and human name on the response.
+════════════════════════════════════════════════════════════ */
+const attachIndicators = (data, range, originalSymbol) => {
+  const closes     = data.candles.map((c) => c.close);
   const rsi        = rsiSeries(closes);
   const macd       = macdSeries(closes);
+  const ema        = emaSeries(closes, EMA_PERIOD);
   const latestRSI  = rsi[rsi.length - 1];
   const latestMACD = macd[macd.length - 1];
+  const latestEMA  = ema[ema.length - 1];
   const sig        = getSignal(latestRSI, latestMACD);
 
+  // Use a human display name for known indices, otherwise fall back to provider name
+  const displayName = getDisplayName(originalSymbol);
+  const name = displayName !== originalSymbol
+    ? displayName
+    : (data.name || originalSymbol);
+
   return {
-    symbol:        data.symbol,
-    name:          data.name,
+    /* ── Identity ── */
+    symbol:       originalSymbol,           // always what the client sent (^NSEI, AAPL …)
+    normalizedAs: data.symbol,              // what was actually fetched (NIFTY50.NS, AAPL …)
+    type:         getSymbolType(originalSymbol), // "INDEX" | "STOCK"
+
+    /* ── Price ── */
+    name,
     price:         data.price,
     open:          data.open,
     high:          data.high,
@@ -67,74 +93,94 @@ const attachIndicators = (data, range) => {
     changePercent: data.changePercent,
     currency:      data.currency,
     exchange:      data.exchange,
+
+    /* ── Summary indicators ── */
     indicators: {
       rsi:    latestRSI,
       macd:   latestMACD,
+      ema:    latestEMA,
       signal: sig,
     },
+
+    /* ── Per-candle chart data ── */
     chart: data.candles.map((c, i) => ({
       ...c,
       rsi:    rsi[i],
       macd:   macd[i],
+      ema:    ema[i],
       signal: rowSig(rsi[i], macd[i]),
     })),
+
     range,
-    provider:   data.provider,   // which provider actually served this
-    fetchedAt:  data.fetchedAt,
+    provider:  data.provider,
+    fetchedAt: data.fetchedAt,
   };
 };
 
 /* ════════════════════════════════════════════════════════════
-   MAIN HANDLER   GET /api/stock/:symbol?range=1M
+   GET /api/stock/:symbol?range=1M
 ════════════════════════════════════════════════════════════ */
 export const getStockData = async (req, res) => {
   try {
-    const symbol = (req.params.symbol || "").toUpperCase().trim();
-    const range  = (req.query.range   || "1M").toUpperCase();
+    const originalSymbol = (req.params.symbol || "").toUpperCase().trim();
+    const range          = (req.query.range   || "1M").toUpperCase();
 
-    if (!symbol)             return res.status(400).json({ error: "Stock symbol is required." });
-    if (!VALID_RANGES.has(range)) return res.status(400).json({ error: `Invalid range "${range}". Valid: 1W 1M 3M 6M 1Y 5Y` });
+    if (!originalSymbol)
+      return res.status(400).json({ error: "Stock symbol is required." });
+    if (!VALID_RANGES.has(range))
+      return res.status(400).json({ error: `Invalid range "${range}". Valid: 1W 1M 3M 6M 1Y 5Y` });
 
-    /* ── Cache check ── */
-    const cKey = serverCacheKey(symbol, range);
+    // ^NSEI → NIFTY50.NS; regular symbols pass through unchanged
+    const symbol = normalizeSymbol(originalSymbol);
+
+    // Cache key uses originalSymbol so ^NSEI and NIFTY50.NS never share an entry
+    const cKey = serverCacheKey(originalSymbol, range);
     const hit  = serverCacheGet(cKey);
     if (hit) {
-      console.log(`⚡ Cache HIT: ${symbol}:${range}`);
+      console.log(`⚡ Cache HIT: ${originalSymbol}:${range}`);
       return res.json(hit);
     }
 
-    /* ── Fetch via engine ── */
     const raw     = await fetchStock(symbol, range);
-    const payload = attachIndicators(raw, range);
+    const payload = attachIndicators(raw, range, originalSymbol);
 
-    /* ── Cache + respond ── */
     serverCacheSet(cKey, payload, serverCacheTTL(range));
     return res.json(payload);
 
   } catch (err) {
-    console.error(`getStockData FATAL [${req?.params?.symbol}]:`, err.message);
+    const originalSymbol = (req?.params?.symbol || "").toUpperCase();
+
+    if (/no data|empty|not found|unsupported/i.test(err.message)) {
+      return res.status(404).json({
+        error:  `No data available for "${originalSymbol}". Check the symbol and try again.`,
+        symbol: originalSymbol,
+      });
+    }
+
+    console.error(`getStockData FATAL [${originalSymbol}]:`, err.message);
     return res.status(500).json({
-      error:  err.message.length > 300 ? "Stock data fetch failed. Please try again." : err.message,
-      symbol: (req?.params?.symbol || "").toUpperCase(),
+      error:  err.message.length > 300
+                ? "Stock data fetch failed. Please try again."
+                : err.message,
+      symbol: originalSymbol,
     });
   }
 };
 
 /* ════════════════════════════════════════════════════════════
-   BATCH HANDLER   POST /api/stock/batch
+   POST /api/stock/batch
    Body: { symbols: string[], range?: string }
 ════════════════════════════════════════════════════════════ */
-
-/* Internal helper — reuse getStockData logic without req/res */
-const fetchOne = async (symbol, range) => {
-  const cKey = serverCacheKey(symbol, range);
-  const hit  = serverCacheGet(cKey);
+const fetchOne = async (originalSymbol, range) => {
+  const symbol = normalizeSymbol(originalSymbol);
+  const cKey   = serverCacheKey(originalSymbol, range);
+  const hit    = serverCacheGet(cKey);
   if (hit) {
-    console.log(`⚡ Batch cache HIT: ${symbol}`);
+    console.log(`⚡ Batch cache HIT: ${originalSymbol}`);
     return hit;
   }
   const raw     = await fetchStock(symbol, range);
-  const payload = attachIndicators(raw, range);
+  const payload = attachIndicators(raw, range, originalSymbol);
   serverCacheSet(cKey, payload, serverCacheTTL(range));
   return payload;
 };
@@ -143,32 +189,29 @@ export const getBatchStockData = async (req, res) => {
   try {
     const { symbols, range = "1W" } = req.body;
 
-    if (!Array.isArray(symbols) || symbols.length === 0) {
+    if (!Array.isArray(symbols) || symbols.length === 0)
       return res.status(400).json({ error: "symbols must be a non-empty array" });
-    }
-    if (symbols.length > 20) {
+    if (symbols.length > 20)
       return res.status(400).json({ error: "Maximum 20 symbols per batch request" });
-    }
-    if (!VALID_RANGES.has(range.toUpperCase())) {
+    if (!VALID_RANGES.has(range.toUpperCase()))
       return res.status(400).json({ error: `Invalid range "${range}"` });
-    }
 
     const results = {};
 
     await Promise.allSettled(
       symbols.map(async (rawSym) => {
-        const symbol = String(rawSym).toUpperCase().trim();
-        if (!symbol) return;
+        const sym = String(rawSym).toUpperCase().trim();
+        if (!sym) return;
         try {
-          results[symbol] = await fetchOne(symbol, range.toUpperCase());
+          results[sym] = await fetchOne(sym, range.toUpperCase());
         } catch (err) {
-          console.warn(`Batch failed for ${symbol}: ${err.message}`);
-          results[symbol] = { error: err.message || "Failed to fetch" };
+          console.warn(`Batch failed for ${sym}: ${err.message}`);
+          results[sym] = { error: err.message || "Failed to fetch" };
         }
       })
     );
 
-    const successCount = Object.values(results).filter(v => !v.error).length;
+    const successCount = Object.values(results).filter((v) => !v.error).length;
     console.log(`✅ Batch complete: ${successCount}/${symbols.length} symbols`);
 
     return res.json({ results });
@@ -185,68 +228,52 @@ export const getBatchStockData = async (req, res) => {
 export const getLiveStock = getLiveStockData;
 
 /* ════════════════════════════════════════════════════════════
-   HEALTH STATS   GET /api/stock/health  (optional debug route)
+   GET /api/stock/health
 ════════════════════════════════════════════════════════════ */
-export const getProviderHealth = (_req, res) => {
-  return res.json(getHealthStats());
-};
+export const getProviderHealth = (_req, res) => res.json(getHealthStats());
+
 /* ════════════════════════════════════════════════════════════
-   QUICK STOCK — Lightweight Dashboard API
    GET /api/stock/:symbol/quick
+   Lightweight Dashboard API — returns live price only, no candles.
 ════════════════════════════════════════════════════════════ */
 export const getQuickStock = async (req, res) => {
   try {
-    const symbol = (req.params.symbol || "").toUpperCase().trim();
-
-    if (!symbol) {
+    const originalSymbol = (req.params.symbol || "").toUpperCase().trim();
+    if (!originalSymbol)
       return res.status(400).json({ error: "Stock symbol is required." });
-    }
 
-    // ✅ Handle index symbols
-    let finalSymbol = symbol;
+    // Normalize: ^NSEI → NIFTY50.NS (no-op for regular symbols)
+    const finalSymbol = normalizeSymbol(originalSymbol);
 
-    if (symbol.startsWith("^")) {
-      const map = {
-        "^NSEI": "NIFTY50.NS",
-        "^NSEBANK": "BANKNIFTY.NS",
-        "^BSESN": "SENSEX.NS"
-      };
-      finalSymbol = map[symbol] || symbol;
-    }
-
-    // ✅ Fetch live data safely
     let live;
     try {
       live = await getLiveStockData(finalSymbol);
     } catch (err) {
       console.warn(`Quick API fetch failed for ${finalSymbol}:`, err.message);
       return res.status(404).json({
-        error: "Stock data not available",
-        symbol,
+        error:  "Stock data not available",
+        symbol: originalSymbol,
       });
     }
 
-    // ✅ Validate response
-    if (!live || live.price == null) {
+    if (!live || live.price == null)
       return res.status(404).json({
-        error: "Invalid or unsupported stock symbol",
-        symbol,
+        error:  "Invalid or unsupported stock symbol",
+        symbol: originalSymbol,
       });
-    }
 
-    const currentPrice = Number(live.price);
-    const prevClose = Number(live.prevClose || currentPrice);
-
-    const change = +(currentPrice - prevClose).toFixed(2);
+    const currentPrice  = Number(live.price);
+    const prevClose     = Number(live.prevClose || currentPrice);
+    const change        = +(currentPrice - prevClose).toFixed(2);
     const changePercent = prevClose
       ? +((change / prevClose) * 100).toFixed(2)
       : 0;
-
     const currency = finalSymbol.endsWith(".NS") ? "INR" : "USD";
 
     return res.json({
-      symbol, // original symbol return (important for frontend)
-      price: currentPrice,
+      symbol:        originalSymbol,             // return what the client sent
+      type:          getSymbolType(originalSymbol),
+      price:         currentPrice,
       change,
       changePercent,
       currency,
@@ -254,9 +281,8 @@ export const getQuickStock = async (req, res) => {
 
   } catch (err) {
     console.error(`getQuickStock ERROR [${req?.params?.symbol}]:`, err.message);
-
     return res.status(500).json({
-      error: "Failed to fetch quick stock data",
+      error:  "Failed to fetch quick stock data",
       symbol: (req?.params?.symbol || "").toUpperCase(),
     });
   }

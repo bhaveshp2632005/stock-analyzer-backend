@@ -9,25 +9,27 @@
  *  5. Response normalization          — all providers return same shape
  *  6. Clear logging                   — success / fail / fallback / rate-limit per fetch
  *
- * Usage:
- *   import { fetchStock } from "./providerEngine.js";
- *   const data = await fetchStock("AAPL", "1M");      // US
- *   const data = await fetchStock("RELIANCE.NS","1M"); // Indian
+ * Index symbol support:
+ *   getLiveStockData() accepts both ^NSEI and NIFTY50.NS — both are normalized
+ *   before any provider is called.
  */
 
-import * as health    from "./providerHealth.js";
-import * as finnhub   from "./finnhub.js";
+import * as health     from "./providerHealth.js";
+import * as finnhub    from "./finnhub.js";
 import * as twelvedata from "./twelvedata.js";
-import * as alphav    from "./alphavantage.js";
-import * as yahoo     from "./yahoo.js";
-import * as nseIndia  from "./nseIndia.js";
+import * as alphav     from "./alphavantage.js";
+import * as yahoo      from "./yahoo.js";
+import * as nseIndia   from "./nseIndia.js";
+import { normalizeSymbol } from "../utils/symbolNormalizer.js";
 
 /* ── Provider registry ── */
 const ALL_PROVIDERS = [finnhub, twelvedata, alphav, yahoo, nseIndia];
 
 /* Provider priority order per market
-   - Indian: NseIndia first (most accurate), then universal providers
-   - US:     Finnhub first (live quote), then universal providers       */
+   - Indian (.NS/.BO): NseIndia first, then universal providers
+   - US:               Finnhub first, then universal providers
+   Note: synthetic index symbols like NIFTY50.NS are Indian by suffix,
+         but NseIndia provider will throw for them — Yahoo handles them. */
 const US_PRIORITY     = ["Finnhub", "TwelveData", "AlphaVantage", "Yahoo"];
 const INDIAN_PRIORITY = ["NseIndia", "TwelveData", "AlphaVantage", "Yahoo"];
 
@@ -114,6 +116,8 @@ const raceProviders = (p1name, p2name, symbol, range) =>
 
 /* ════════════════════════════════════════════════════════════
    MAIN: fetchStock(symbol, range)
+   Expects an already-normalized symbol (e.g. NIFTY50.NS, not ^NSEI).
+   normalizeSymbol() must be called in stock.controller.js before this.
    Tries providers in health-sorted priority order.
    Activates parallel racing if primary is slow.
 ════════════════════════════════════════════════════════════ */
@@ -146,13 +150,12 @@ export const fetchStock = async (symbol, range) => {
         let primaryDone   = false;
 
         const primaryPromise = tryProvider(primary, symbol, range).then(d => {
-          primaryDone = true;
+          primaryDone   = true;
           primaryResult = d;
           return d;
         });
 
         // Attach .catch immediately — prevents Node.js unhandled rejection crash
-        // The actual error is handled in the catch block below
         primaryPromise.catch(() => {});
 
         // Wait RACE_THRESHOLD_MS; if primary not done, start racing
@@ -204,7 +207,6 @@ export const fetchStock = async (symbol, range) => {
 const normalizeResponse = (data, symbol, range) => {
   const last = data.candles?.[data.candles.length - 1];
 
-  // Ensure all required fields exist
   return {
     symbol:        data.symbol        || symbol,
     name:          data.name          || symbol,
@@ -225,44 +227,76 @@ const normalizeResponse = (data, symbol, range) => {
 
 /* ════════════════════════════════════════════════════════════
    getLiveStockData — lightweight live price for WebSocket
-   Uses fastest available provider for a quick quote
+   Accepts both raw (^NSEI) and normalized (NIFTY50.NS) symbols.
+   Uses fastest available provider for a quick quote.
 ════════════════════════════════════════════════════════════ */
-export const getLiveStockData = async (symbol) => {
-  symbol = symbol.toUpperCase();
+export const getLiveStockData = async (rawSymbol) => {
+  // Normalize so ^NSEI → NIFTY50.NS and regular symbols pass through unchanged
+  const symbol = normalizeSymbol(String(rawSymbol).toUpperCase().trim());
 
   if (isIndian(symbol)) {
-    // NseIndia is best for live Indian quotes
-    if (health.isAvailable("NseIndia")) {
+    // NseIndia handles real equity symbols (.NS) but NOT synthetic index ones
+    // like NIFTY50.NS / BANKNIFTY.NS / SENSEX.NS — skip it for those
+    const isSyntheticIndex = /^(NIFTY50|BANKNIFTY|SENSEX)\.NS$/i.test(symbol);
+
+    if (!isSyntheticIndex && health.isAvailable("NseIndia")) {
       try {
         return await nseIndia.getLiveQuote(symbol);
       } catch (e) {
         console.warn(`[Engine] NseIndia live failed: ${e.message}, falling back to Yahoo`);
       }
     }
-    // Fallback to Yahoo for live Indian
+
+    // For synthetic index symbols and NseIndia failures — use Yahoo
     const ySym = /\.(NS|BO)$/i.test(symbol) ? symbol : symbol + ".NS";
     const data = await yahoo.fetch(ySym, "1W");
     const last = data.candles[data.candles.length - 1];
     return {
-      symbol, price: data.price, changePercent: data.changePercent,
-      open: data.open, high: data.high, low: data.low, prevClose: data.prevClose,
-      tick: { time: new Date().toISOString(), close: data.price, open: data.open, high: data.high, low: data.low, volume: last?.volume || 0 },
+      symbol,
+      price:         data.price,
+      changePercent: data.changePercent,
+      open:          data.open,
+      high:          data.high,
+      low:           data.low,
+      prevClose:     data.prevClose,
+      tick: {
+        time:   new Date().toISOString(),
+        close:  data.price,
+        open:   data.open,
+        high:   data.high,
+        low:    data.low,
+        volume: last?.volume || 0,
+      },
     };
   }
 
-  // US: Finnhub is best for live quotes
+  // US stocks: Finnhub is best for live quotes
   if (health.isAvailable("Finnhub")) {
     try {
       const { default: axios } = await import("axios");
       const key = process.env.FINNHUB_KEY || process.env.FINNHUB_API_KEY;
-      const { data } = await axios.get("https://finnhub.io/api/v1/quote", { params: { symbol, token: key }, timeout: 8000 });
+      const { data } = await axios.get("https://finnhub.io/api/v1/quote", {
+        params:  { symbol, token: key },
+        timeout: 8000,
+      });
       if (data?.c > 0) {
         health.recordSuccess("Finnhub", 0);
         return {
-          symbol, price: +data.c.toFixed(2),
+          symbol,
+          price:         +data.c.toFixed(2),
           changePercent: (((data.c - data.pc) / data.pc) * 100).toFixed(2),
-          open: data.o, high: data.h, low: data.l, prevClose: data.pc,
-          tick: { time: new Date().toISOString(), close: data.c, open: data.o, high: data.h, low: data.l, volume: data.v || 0 },
+          open:          data.o,
+          high:          data.h,
+          low:           data.l,
+          prevClose:     data.pc,
+          tick: {
+            time:   new Date().toISOString(),
+            close:  data.c,
+            open:   data.o,
+            high:   data.h,
+            low:    data.l,
+            volume: data.v || 0,
+          },
         };
       }
     } catch (e) {
@@ -270,15 +304,27 @@ export const getLiveStockData = async (symbol) => {
     }
   }
 
-  // Fallback: Yahoo live
+  // Final fallback: Yahoo live
   const data = await yahoo.fetch(symbol, "1W");
   return {
-    symbol, price: data.price, changePercent: data.changePercent,
-    open: data.open, high: data.high, low: data.low, prevClose: data.prevClose,
-    tick: { time: new Date().toISOString(), close: data.price, open: data.open, high: data.high, low: data.low, volume: 0 },
+    symbol,
+    price:         data.price,
+    changePercent: data.changePercent,
+    open:          data.open,
+    high:          data.high,
+    low:           data.low,
+    prevClose:     data.prevClose,
+    tick: {
+      time:   new Date().toISOString(),
+      close:  data.price,
+      open:   data.open,
+      high:   data.high,
+      low:    data.low,
+      volume: 0,
+    },
   };
 };
 
 /* ── Export health stats for monitoring ── */
-export const getHealthStats  = health.getStats;
-export const resetProvider   = health.resetProvider;
+export const getHealthStats = health.getStats;
+export const resetProvider  = health.resetProvider;
