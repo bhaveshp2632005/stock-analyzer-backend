@@ -1,38 +1,43 @@
 /**
  * utils/symbolNormalizer.js
  *
- * Single source of truth for index symbol mapping.
+ * Maps index symbols to synthetic .NS equivalents that travel
+ * cleanly through the provider engine.
  *
- * Maps index symbols (^NSEI, ^BSESN, ^NSEBANK) to synthetic .NS equivalents
- * that travel cleanly through the provider engine.
+ * IMPORTANT — handles TWO input forms:
+ *   ^NSEI   (frontend sends this; Express usually preserves the ^)
+ *   NSEI    (Express strips ^ from :symbol route params in some configs)
  *
- * Yahoo provider then reverse-maps these back to ^NSEI etc. for its API calls.
- * NseIndia provider explicitly rejects them so Yahoo gets the fallback.
- *
- * ALL other symbols (AAPL, RELIANCE.NS, TCS.NS …) pass through unchanged.
+ * Both forms map to NIFTY50.NS so the engine always receives a clean symbol.
+ * Yahoo provider reverse-maps NIFTY50.NS → ^NSEI for its own API calls.
+ * NseIndia provider explicitly rejects synthetic index symbols.
+ * All other symbols (AAPL, RELIANCE.NS …) pass through unchanged.
  */
 
-/** ^-style index → normalized fetchable symbol */
 const INDEX_MAP = {
+  // with caret
   "^NSEI":    "NIFTY50.NS",
   "^BSESN":   "SENSEX.NS",
   "^NSEBANK": "BANKNIFTY.NS",
+  // without caret (Express strips ^ in some router/middleware configs)
+  "NSEI":     "NIFTY50.NS",
+  "BSESN":    "SENSEX.NS",
+  "NSEBANK":  "BANKNIFTY.NS",
 };
 
-/** Display names shown in the UI */
 const DISPLAY_NAMES = {
   "^NSEI":    "NIFTY 50",
   "^BSESN":   "SENSEX",
   "^NSEBANK": "BANK NIFTY",
+  "NSEI":     "NIFTY 50",
+  "BSESN":    "SENSEX",
+  "NSEBANK":  "BANK NIFTY",
 };
 
 /**
  * normalizeSymbol(raw)
- * Maps ^NSEI → NIFTY50.NS etc.
- * For all other symbols this is a no-op (uppercase + trim only).
- *
- * @param {string} raw - symbol as received from client
- * @returns {string}   - symbol safe to pass to providerEngine
+ * Maps ^NSEI / NSEI → NIFTY50.NS etc.
+ * No-op for all other symbols.
  */
 export const normalizeSymbol = (raw = "") => {
   const upper = String(raw).toUpperCase().trim();
@@ -41,25 +46,22 @@ export const normalizeSymbol = (raw = "") => {
 
 /**
  * isIndexSymbol(raw)
- * Returns true for recognized ^-style index inputs.
+ * Returns true for both ^NSEI and bare NSEI forms.
  */
 export const isIndexSymbol = (raw = "") =>
   String(raw).toUpperCase().trim() in INDEX_MAP;
 
 /**
  * getSymbolType(raw)
- * Returns "INDEX" for recognized index symbols, "STOCK" for everything else.
- * Used to tag API responses so the frontend can render accordingly.
+ * "INDEX" | "STOCK"
  */
 export const getSymbolType = (raw = "") =>
   isIndexSymbol(raw) ? "INDEX" : "STOCK";
 
 /**
  * getDisplayName(raw)
- * Human-readable label for known indices; falls back to the symbol itself.
- *
- * @param {string} raw
- * @returns {string}
+ * Human-readable label for known indices; falls back to symbol itself.
  */
 export const getDisplayName = (raw = "") =>
-  DISPLAY_NAMES[String(raw).toUpperCase().trim()] ?? String(raw).toUpperCase().trim();
+  DISPLAY_NAMES[String(raw).toUpperCase().trim()] ??
+  String(raw).toUpperCase().trim();
