@@ -1,16 +1,15 @@
 /**
  * providers/yahoo.js
- * Yahoo Finance provider — US + Indian stocks + Index symbols
+ * Yahoo Finance — Universal fallback provider for ALL asset classes
  *
- * Supports: All symbols (universal fallback)
+ * Handles: US stocks, ETFs, Indian stocks, Indian/US/Global indices,
+ *          Crypto, Forex, UK/Japan/Germany/HK/Canada/Australia stocks
  *
- * Fixes vs previous version:
- *  1. NORMALIZED_TO_YAHOO reverse-map so NIFTY50.NS → ^NSEI in Yahoo API URL
- *  2. Index symbols (^NSEI etc.) bypass crumb auth completely — they are public
- *     Yahoo endpoints and the crumb homepage fetch causes "Header overflow"
- *     on cloud hosts (Render/Railway) due to massive Set-Cookie response headers
- *  3. Crumb fetch now uses the lightweight query1 endpoint directly instead of
- *     scraping the finance.yahoo.com homepage — avoids Header overflow for stocks
+ * Fixes:
+ *  1. NORMALIZED_TO_YAHOO map — NIFTY50.NS → ^NSEI in the actual API URL
+ *  2. Index symbols skip crumb auth — they are public Yahoo endpoints.
+ *     Crumb homepage fetch causes "Header overflow" on Render/Railway.
+ *  3. Lightweight crumb endpoint — avoids massive Set-Cookie header overflow.
  */
 
 import axios from "axios";
@@ -19,13 +18,12 @@ export const NAME = "Yahoo";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36";
 
-/* ── Crumb cache (module-level singleton) ── */
+/* ── Crumb cache ── */
 let _crumbCache = null;
 
 /**
- * getYahooCrumb — lightweight version
- * Uses query1 crumb endpoint directly, NOT the finance.yahoo.com homepage.
- * The homepage sends enormous Set-Cookie headers that overflow axios on Render.
+ * Lightweight crumb fetch — uses query1 endpoint directly.
+ * Does NOT scrape finance.yahoo.com homepage (causes Header overflow on cloud hosts).
  */
 const getYahooCrumb = async () => {
   const now = Date.now();
@@ -40,7 +38,6 @@ const getYahooCrumb = async () => {
         "Accept":          "*/*",
         "Accept-Language": "en-US,en;q=0.9",
       },
-      // Limit response size to prevent Header overflow
       maxContentLength: 100 * 1024,
       maxBodyLength:    100 * 1024,
       maxRedirects:     3,
@@ -71,9 +68,9 @@ const RANGE_MAP = {
 const isIndian = (s) => /\.(NS|BO|NSE|BSE)$/i.test(s);
 
 /**
- * Reverse map: normalized index symbols → Yahoo's native tickers.
- * normalizeSymbol() converts ^NSEI → NIFTY50.NS before reaching this provider.
- * Yahoo's API only understands ^NSEI, not NIFTY50.NS, so we translate back here.
+ * Reverse map: normalized index symbols → Yahoo native tickers.
+ * normalizeSymbol() converts ^NSEI → NIFTY50.NS before this provider.
+ * Yahoo's API only accepts ^NSEI, so we translate back here.
  */
 const NORMALIZED_TO_YAHOO = {
   "NIFTY50.NS":   "^NSEI",
@@ -82,24 +79,26 @@ const NORMALIZED_TO_YAHOO = {
 };
 
 /**
- * Index tickers starting with ^ are fully public on Yahoo — no crumb needed.
- * Skipping crumb for these avoids Header overflow errors on cloud hosts.
+ * ^ symbols on Yahoo are fully public — no crumb/cookie needed.
+ * Skipping crumb for these avoids Header overflow on cloud hosts.
  */
-const isYahooIndex = (yahooSym) => String(yahooSym).startsWith("^");
+const isPublicYahooSymbol = (yahooSym) =>
+  String(yahooSym).startsWith("^") ||
+  /^[A-Z0-9]{2,10}-(USD|INR|EUR|GBP|BTC|ETH|USDT)$/i.test(yahooSym) || // crypto
+  /=X$/i.test(yahooSym); // forex
 
-export const supports = (_symbol) => true; // universal fallback
+export const supports = (_symbol) => true; // universal — handles everything
 
 export const fetch = async (symbol, range) => {
-  // Translate normalized index symbols back to Yahoo-native tickers
+  // Translate normalized index symbols to Yahoo-native form
   const yahooSymbol = NORMALIZED_TO_YAHOO[symbol] ?? symbol;
 
   const { yRange, interval } = RANGE_MAP[range] || RANGE_MAP["1M"];
   let data;
   let lastErr;
 
-  // Index symbols: skip crumb entirely (public endpoint, avoids Header overflow)
-  // Regular stocks: try crumb first for better rate limits, fall back without
-  const crumbAttempts = isYahooIndex(yahooSymbol) ? [false] : [true, false];
+  // Public symbols skip crumb entirely — avoids Header overflow
+  const crumbAttempts = isPublicYahooSymbol(yahooSymbol) ? [false] : [true, false];
 
   for (const useCrumb of crumbAttempts) {
     try {
@@ -117,7 +116,7 @@ export const fetch = async (symbol, range) => {
           if (auth.cookies) headers.Cookie = auth.cookies;
         } catch (crumbErr) {
           // Non-fatal — proceed without crumb
-          console.warn(`[Yahoo] Crumb fetch failed: ${crumbErr.message} — proceeding without crumb`);
+          console.warn(`[Yahoo] Crumb failed (${crumbErr.message}) — proceeding without`);
         }
       }
 
@@ -134,9 +133,7 @@ export const fetch = async (symbol, range) => {
       if (data?.chart?.result?.[0]) break;
     } catch (e) {
       lastErr = e;
-      if (useCrumb) {
-        _crumbCache = null; // invalidate on any crumb-related failure
-      }
+      if (useCrumb) _crumbCache = null;
     }
   }
 
@@ -165,7 +162,7 @@ export const fetch = async (symbol, range) => {
   const chgPct    = prevClose ? +((( price - prevClose) / prevClose) * 100).toFixed(2) : 0;
 
   return {
-    symbol,          // return normalized form (NIFTY50.NS), not yahooSymbol (^NSEI)
+    symbol,          // normalized form (NIFTY50.NS), not yahooSymbol (^NSEI)
     name:          meta.shortName || meta.longName || symbol,
     price:         +Number(price).toFixed(2),
     open:          meta.regularMarketOpen    != null ? +Number(meta.regularMarketOpen).toFixed(2)    : last.open,

@@ -1,50 +1,44 @@
 /**
  * providers/nseIndia.js
- * NSE India provider — Indian stocks only
+ * NSE India provider — real Indian equity stocks only
  *
  * Supports: .NS / .BO symbols (strips suffix internally)
  * Does NOT support synthetic index symbols: NIFTY50.NS, BANKNIFTY.NS, SENSEX.NS
- *   — these are handled by Yahoo (which maps them back to ^NSEI etc.)
+ *   — those are routed directly to Yahoo by providerEngine
  *
  * Package: stock-nse-india
- * Rate limit: Informal — no strict limit for reasonable use
  */
 
 export const NAME = "NseIndia";
 
-const toNSE = (s) => s.replace(/\.(NS|BO|NSE|BSE)$/i, "");
-const isIndian = (s) => /\.(NS|BO|NSE|BSE)$/i.test(s);
+const toNSE     = (s)  => s.replace(/\.(NS|BO|NSE|BSE)$/i, "");
+const isIndian  = (s)  => /\.(NS|BO|NSE|BSE)$/i.test(s);
 
-/**
- * Synthetic index symbols normalized from ^NSEI/^BSESN/^NSEBANK.
- * NseIndia's equity API doesn't handle these — Yahoo does.
- */
-const SYNTHETIC_INDEX_SYMBOLS = new Set([
+// Synthetic index symbols created by normalizeSymbol() — NseIndia can't handle these
+const SYNTHETIC_INDICES = new Set([
   "NIFTY50.NS",
   "BANKNIFTY.NS",
   "SENSEX.NS",
 ]);
 
 export const supports = (symbol) =>
-  isIndian(symbol) && !SYNTHETIC_INDEX_SYMBOLS.has(symbol.toUpperCase());
+  isIndian(symbol) && !SYNTHETIC_INDICES.has(symbol.toUpperCase());
 
 export const fetch = async (symbol, range) => {
   if (!isIndian(symbol))
     throw new Error(`NseIndia: ${symbol} is not an Indian symbol`);
-
-  if (SYNTHETIC_INDEX_SYMBOLS.has(symbol.toUpperCase()))
-    throw new Error(`NseIndia: ${symbol} is a synthetic index — use Yahoo provider`);
+  if (SYNTHETIC_INDICES.has(symbol.toUpperCase()))
+    throw new Error(`NseIndia: ${symbol} is a synthetic index — handled by Yahoo`);
 
   const { NseIndia } = await import("stock-nse-india");
   const nse       = new NseIndia();
   const nseSymbol = toNSE(symbol);
 
-  // Calculate date range for historical data
   const DAYS = { "1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "5Y": 1825 };
   const days  = DAYS[range] || 30;
   const end   = new Date();
   const start = new Date();
-  start.setDate(start.getDate() - days - 10); // buffer
+  start.setDate(start.getDate() - days - 10);
 
   const [details, historical] = await Promise.all([
     nse.getEquityDetails(nseSymbol),
@@ -58,11 +52,10 @@ export const fetch = async (symbol, range) => {
   const prevClose = details.priceInfo.previousClose || price;
   const chgPct    = prevClose ? (((price - prevClose) / prevClose) * 100).toFixed(2) : "0";
 
-  // Parse historical candles — NSE returns data in different shapes
   let raw = [];
   if (Array.isArray(historical)) {
-    if (historical[0]?.data)              raw = historical.flatMap(x => x.data || []);
-    else if (historical[0]?.CH_TIMESTAMP) raw = historical;
+    if (historical[0]?.data)               raw = historical.flatMap(x => x.data || []);
+    else if (historical[0]?.CH_TIMESTAMP)  raw = historical;
     else if (Array.isArray(historical[0])) raw = historical.flat();
   } else if (historical?.data) {
     raw = historical.data;
@@ -82,7 +75,6 @@ export const fetch = async (symbol, range) => {
   .filter(v => v.close > 0 && v.date?.length === 10)
   .sort((a, b) => new Date(a.date) - new Date(b.date));
 
-  // If historical data is empty but we have live price, build a minimal candle
   if (!candles.length) {
     console.warn(`[NseIndia] No historical candles for ${nseSymbol} — using live price only`);
     candles = [{
@@ -117,11 +109,10 @@ export const fetch = async (symbol, range) => {
   };
 };
 
-/* ── getLiveQuote for socket manager / providerEngine ── */
+/* ── getLiveQuote for socket / quick API ── */
 export const getLiveQuote = async (symbol) => {
-  // Reject synthetic index symbols early
-  if (SYNTHETIC_INDEX_SYMBOLS.has(symbol.toUpperCase()))
-    throw new Error(`NseIndia: ${symbol} is a synthetic index — use Yahoo provider`);
+  if (SYNTHETIC_INDICES.has(symbol.toUpperCase()))
+    throw new Error(`NseIndia: ${symbol} is a synthetic index — use Yahoo`);
 
   const { NseIndia } = await import("stock-nse-india");
   const nse     = new NseIndia();
@@ -141,6 +132,7 @@ export const getLiveQuote = async (symbol) => {
     high:          details.priceInfo.intraDayHighLow?.max,
     low:           details.priceInfo.intraDayHighLow?.min,
     prevClose:     prev,
+    currency:      "INR",
     tick: {
       time:   new Date().toISOString(),
       close:  price,
