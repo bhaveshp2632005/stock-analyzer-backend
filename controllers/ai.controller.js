@@ -1,22 +1,18 @@
 /**
- * ai.controller.js — Node.js ↔ Python AI Engine bridge (v3.0)
- * ═══════════════════════════════════════════════════════════════
+ * ai.controller.js — Node.js ↔ Python AI Engine bridge v5.0
+ * ═══════════════════════════════════════════════════════════
  *
- * Routes (all mounted at /api/ai in server.js):
- *   POST /api/ai/analyze          → quick signal (Python /analyze)
- *   POST /api/ai/predict          → full LSTM+XGB prediction
- *   GET  /api/ai/regime/:symbol   → market regime
- *   GET  /api/ai/sentiment/:symbol
- *   POST /api/ai/portfolio        → MPT optimizer
- *   GET  /api/ai/risk/:symbol
- *   POST /api/ai/backtest
- *   GET  /api/ai/indicators/:symbol
- *   GET  /api/ai/chart/:symbol
- *   GET  /api/ai/timeframes/:symbol
- *   GET  /api/ai/macro
- *   POST /api/ai/rl/train
- *   GET  /api/ai/rl/evaluate/:symbol
- *   GET  /api/ai/health
+ * v5.0 CHANGE: predict() now fetches OHLCV data from Node.js stock service
+ * and sends it to Python. Python no longer calls data_loader.py.
+ *
+ * Flow:
+ *   Frontend → Node /api/ai/predict
+ *     → fetchChartData() gets candles from Node stock service
+ *     → Python /predict receives { symbol, chart[], indicators{}, currentPrice }
+ *     → Python predicts using provided data (no external API calls)
+ *     → Response forwarded to frontend
+ *
+ * All other endpoints (regime, sentiment, risk, etc.) unchanged.
  */
 import axios    from "axios";
 import Analysis from "../models/Analysis.model.js";
@@ -30,9 +26,9 @@ const aiClient = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
-// ── In-memory TTL cache (Node side — avoids double-fetching) ─────────────────
+// ── In-memory TTL cache ───────────────────────────────────────────────────────
 const _cache    = new Map();
-const CACHE_TTL = Number(process.env.AI_CACHE_TTL_MS) || 900_000; // 15 min
+const CACHE_TTL = Number(process.env.AI_CACHE_TTL_MS) || 900_000;
 
 const cget = (k) => {
   const e = _cache.get(k);
@@ -62,16 +58,102 @@ const handleErr = (res, err, ctx) => {
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
+// v5.0 HELPER: Fetch chart data from Node.js stock service
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * fetchChartData()
+ *
+ * Gets OHLCV candles from the Node.js stock endpoint that already exists.
+ * Returns { chart, currentPrice, indicators } to send to Python.
+ *
+ * Tries multiple internal endpoints in order:
+ *   1. /api/stock/history/:symbol?range=2y  ← preferred (most data)
+ *   2. /api/stock/chart/:symbol             ← fallback
+ *   3. /api/stock/:symbol                   ← minimal fallback
+ *
+ * IMPORTANT: Adjust the endpoint URLs below to match YOUR Node.js stock routes.
+ */
+const NODE_BASE = process.env.NODE_INTERNAL_URL || "http://localhost:5000";
+
+const nodeClient = axios.create({
+  baseURL: NODE_BASE,
+  timeout: 15_000,  // 15s for data fetch
+});
+
+async function fetchChartData(symbol, authHeader) {
+  const headers = authHeader ? { Authorization: authHeader } : {};
+
+  // Try endpoint 1: history with 2-year range (sends most candles)
+  try {
+    const { data } = await nodeClient.get(
+      `/api/stock/history/${symbol}`,
+      { params: { range: "2y", interval: "1d" }, headers }
+    );
+
+    // Normalise response — your stock route may return different shapes
+    const candles = Array.isArray(data)
+      ? data
+      : data?.chart || data?.history || data?.candles || data?.data || [];
+
+    if (candles.length >= 60) {
+      const last         = candles[candles.length - 1];
+      const currentPrice = last?.close || last?.price || null;
+      return { chart: candles, currentPrice };
+    }
+  } catch (e) {
+    console.warn(`[AI] fetchChartData endpoint1 failed for ${symbol}:`, e.message);
+  }
+
+  // Try endpoint 2: chart endpoint
+  try {
+    const { data } = await nodeClient.get(
+      `/api/stock/chart/${symbol}`,
+      { headers }
+    );
+    const candles = Array.isArray(data)
+      ? data
+      : data?.chart || data?.candles || data?.data || [];
+
+    if (candles.length >= 60) {
+      const last         = candles[candles.length - 1];
+      const currentPrice = last?.close || last?.price || null;
+      return { chart: candles, currentPrice };
+    }
+  } catch (e) {
+    console.warn(`[AI] fetchChartData endpoint2 failed for ${symbol}:`, e.message);
+  }
+
+  // Try endpoint 3: basic stock quote (may only have indicators, not full history)
+  try {
+    const { data } = await nodeClient.get(`/api/stock/${symbol}`, { headers });
+    const candles = data?.history || data?.chart || data?.candles || [];
+
+    if (candles.length >= 60) {
+      return {
+        chart:        candles,
+        currentPrice: data?.price || data?.currentPrice || null,
+        indicators:   data?.indicators || data?.technicals || null,
+      };
+    }
+  } catch (e) {
+    console.warn(`[AI] fetchChartData endpoint3 failed for ${symbol}:`, e.message);
+  }
+
+  // All internal fetches failed — Python will fallback to data_loader
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // CONTROLLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Quick AI Signal (used by Analyze.jsx "Quick AI Signal" button) ────────────
+// ── Quick AI Signal ───────────────────────────────────────────────────────────
 export const analyzeQuick = async (req, res) => {
   try {
     const { data } = await aiClient.post("/analyze", req.body);
     return res.json(data);
   } catch (err) {
-    // Soft failure — return neutral HOLD so UI doesn't break
     if (err.code === "ECONNREFUSED")
       return res.json({ action: "HOLD", confidence: 30,
                         summary: "AI Engine offline — showing neutral signal", score: 0 });
@@ -79,34 +161,73 @@ export const analyzeQuick = async (req, res) => {
   }
 };
 
-// ── Full Prediction (LSTM + XGBoost + FinBERT) ────────────────────────────────
+// ── Full Prediction — v5.0: sends chart data to Python ───────────────────────
 export const predict = async (req, res) => {
   const {
     symbol,
-    horizon          = 5,
-    skipSentiment    = false,
-    includeChart     = false,
-    includeBacktest  = false,
-    includeRisk      = true,
-    lstmEpochs       = 60,
+    horizon         = 5,
+    skipSentiment   = false,
+    includeChart    = false,
+    includeBacktest = false,
+    includeRisk     = true,
+    lstmEpochs      = 60,
+    // Node.js may already have these from its own data fetch:
+    chart: chartFromFrontend  = null,
+    indicators: indFromFront  = null,
+    currentPrice: cpFromFront = null,
+    currency                  = "USD",
   } = req.body;
- console.log(`[AI] Predict request: ${symbol}, horizon: ${horizon}d, skipSentiment: ${skipSentiment}, includeChart: ${includeChart}, includeBacktest: ${includeBacktest}, includeRisk: ${includeRisk}, lstmEpochs: ${lstmEpochs}`);
+
+  console.log(`[AI] Predict request: ${symbol}, horizon: ${horizon}d`);
   if (!symbol) return res.status(400).json({ message: "symbol required" });
+
   const sym = symbol.toUpperCase().trim();
   const ck  = `predict:${sym}:${horizon}`;
   const cached = cget(ck);
   if (cached) return res.json({ ...cached, fromCache: true });
 
+  // ── Step 1: Get chart data ─────────────────────────────────────────────────
+  // Priority: frontend sent it → fetch from Node stock service → let Python fetch
+  let chart      = chartFromFrontend;
+  let indicators = indFromFront;
+  let currentPrice = cpFromFront;
+
+  if (!chart || chart.length < 60) {
+    console.log(`[AI] Fetching chart data for ${sym} from Node stock service…`);
+    const fetched = await fetchChartData(sym, req.headers.authorization);
+    if (fetched?.chart?.length >= 60) {
+      chart        = fetched.chart;
+      currentPrice = fetched.currentPrice || currentPrice;
+      indicators   = fetched.indicators   || indicators;
+      console.log(`[AI] Got ${chart.length} candles from Node stock service`);
+    } else {
+      // Python will use its own data_loader as last resort
+      console.warn(`[AI] Could not get chart data from Node — Python will fetch itself`);
+    }
+  }
+
+  // ── Step 2: Build Python request payload ──────────────────────────────────
+  const payload = {
+    symbol:          sym,
+    horizon,
+    skip_sentiment:  skipSentiment,
+    include_chart:   includeChart,
+    include_backtest: includeBacktest,
+    include_risk:    includeRisk,
+    lstm_epochs:     lstmEpochs,
+    currency,
+  };
+
+  // Add pre-fetched data if available
+  if (chart && chart.length >= 60) {
+    payload.chart         = chart;
+    payload.current_price = currentPrice;
+    payload.indicators    = indicators;
+  }
+
+  // ── Step 3: Call Python ───────────────────────────────────────────────────
   try {
-    const { data } = await aiClient.post("/predict", {
-      symbol:           sym,
-      horizon,
-      skip_sentiment:   skipSentiment,
-      include_chart:    includeChart,
-      include_backtest: includeBacktest,
-      include_risk:     includeRisk,
-      lstm_epochs:      lstmEpochs,
-    });
+    const { data } = await aiClient.post("/predict", payload);
 
     // Persist to MongoDB (non-blocking)
     if (req.user?.id) {
@@ -114,7 +235,7 @@ export const predict = async (req, res) => {
         { userId: req.user.id, symbol: sym },
         {
           $set: {
-            price:      String(data.currentPrice ?? ""),
+            price:      String(data.currentPrice ?? currentPrice ?? ""),
             signal:     data.trend === "Bullish" ? "BUY"
                       : data.trend === "Bearish" ? "SELL" : "HOLD",
             confidence: data.confidence ?? 0,
@@ -188,13 +309,16 @@ export const risk = async (req, res) => {
 
 // ── Backtest ──────────────────────────────────────────────────────────────────
 export const backtest = async (req, res) => {
-  const { symbol, initialCash = 100000, signalThreshold = 1.5 } = req.body;
+  const { symbol, initialCash = 100000, signalThreshold = 1.5,
+          stopLossPct = 0.06, takeProfitPct = 0.12 } = req.body;
   if (!symbol) return res.status(400).json({ message: "symbol required" });
   try {
     const { data } = await aiClient.post("/backtest", {
       symbol:           symbol.toUpperCase(),
       initial_cash:     initialCash,
       signal_threshold: signalThreshold,
+      stop_loss_pct:    stopLossPct,
+      take_profit_pct:  takeProfitPct,
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Backtest"); }
