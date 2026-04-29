@@ -69,6 +69,7 @@ const apiLimiter = rateLimit({
 /* ══════════════════════════════════════════
    ROUTES
 ══════════════════════════════════════════ */
+app.set("trust proxy", 1);
 app.use("/api/indices", apiLimiter, indicesRoutes);
 app.use("/api/auth",      authLimiter, authRoutes);
 app.use("/api/stock",     apiLimiter,  stockRoutes);
