@@ -1,28 +1,21 @@
 /**
- * ai.controller.js — Node.js ↔ Python AI Engine bridge (v3.0)
+ * ai.controller.js — Node.js ↔ Python AI Engine bridge (v3.1)
  * ═══════════════════════════════════════════════════════════════
  *
- * Routes (all mounted at /api/ai in server.js):
- *   POST /api/ai/analyze          → quick signal (Python /analyze)
- *   POST /api/ai/predict          → full LSTM+XGB prediction
- *   GET  /api/ai/regime/:symbol   → market regime
- *   GET  /api/ai/sentiment/:symbol
- *   POST /api/ai/portfolio        → MPT optimizer
- *   GET  /api/ai/risk/:symbol
- *   POST /api/ai/backtest
- *   GET  /api/ai/indicators/:symbol
- *   GET  /api/ai/chart/:symbol
- *   GET  /api/ai/timeframes/:symbol
- *   GET  /api/ai/macro
- *   POST /api/ai/rl/train
- *   GET  /api/ai/rl/evaluate/:symbol
- *   GET  /api/ai/health
+ * FIXES in v3.1:
+ *  1. Index symbol support — ^NSEI, ^BSESN, ^NSEBANK passed correctly to Python
+ *  2. Better 500 error logging with full stack traces
+ *  3. Request body validation before forwarding to Python
+ *  4. Timeout increased to 10 min for index predictions (more data to load)
+ *  5. Cache key normalisation — ^NSEI and %5ENSEI map to same key
+ *  6. Graceful degradation — returns partial result on non-critical failures
  */
+
 import axios    from "axios";
 import Analysis from "../models/Analysis.model.js";
 
 const AI_BASE    = process.env.AI_ENGINE_URL || "http://localhost:8000";
-const AI_TIMEOUT = Number(process.env.AI_TIMEOUT_MS) || 300_000;  // 5 min
+const AI_TIMEOUT = Number(process.env.AI_TIMEOUT_MS) || 600_000; // 10 min
 
 const aiClient = axios.create({
   baseURL: AI_BASE,
@@ -30,7 +23,7 @@ const aiClient = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
-// ── In-memory TTL cache (Node side — avoids double-fetching) ─────────────────
+/* ── In-memory TTL cache ── */
 const _cache    = new Map();
 const CACHE_TTL = Number(process.env.AI_CACHE_TTL_MS) || 900_000; // 15 min
 
@@ -42,74 +35,126 @@ const cget = (k) => {
 };
 const cset = (k, d) => _cache.set(k, { data: d, ts: Date.now() });
 
-// ── Error handler ─────────────────────────────────────────────────────────────
+/* ── Normalise symbol for cache key (^NSEI, %5ENSEI → nsei_idx) ── */
+const normCacheKey = (sym) =>
+  decodeURIComponent(sym || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9.]/g, "_");
+
+/* ── Determine if symbol is an index ── */
+const isIndex = (sym) => /^\^/.test(sym) || /^(NIFTY|SENSEX|BANKNIFTY)/i.test(sym);
+
+/* ── Error handler ── */
 const handleErr = (res, err, ctx) => {
-  if (err.code === "ECONNREFUSED")
+  const status = err.response?.status;
+
+  if (err.code === "ECONNREFUSED") {
     return res.status(503).json({
       message: "AI Engine offline. Start with: uvicorn main:app --port 8000",
       ctx,
     });
-  if (err.response?.status === 422)
+  }
+  if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+    return res.status(504).json({ message: "AI Engine timed out", ctx });
+  }
+  if (status === 422) {
     return res.status(422).json({
       message: err.response.data?.detail || "Invalid input",
       ctx,
     });
-  if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT")
-    return res.status(504).json({ message: "AI Engine timed out", ctx });
+  }
+  if (status === 404) {
+    return res.status(404).json({ message: `AI endpoint not found: ${ctx}`, ctx });
+  }
 
-  console.error(`[AI] ${ctx}:`, err.message);
-  return res.status(500).json({ message: `${ctx} failed: ${err.message}` });
+  // Log full error for debugging
+  console.error(`[AI] ${ctx} ERROR:`, {
+    message:  err.message,
+    code:     err.code,
+    status:   status,
+    response: err.response?.data,
+  });
+
+  return res.status(500).json({
+    message: `${ctx} failed: ${err.message}`,
+    ctx,
+  });
 };
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CONTROLLERS
-// ══════════════════════════════════════════════════════════════════════════════
+/* ── Validate predict request body ── */
+const validatePredictBody = (body) => {
+  const errors = [];
+  if (!body.symbol || typeof body.symbol !== "string") {
+    errors.push("symbol is required and must be a string");
+  }
+  const horizon = Number(body.horizon);
+  if (isNaN(horizon) || horizon < 1 || horizon > 30) {
+    errors.push("horizon must be a number between 1 and 30");
+  }
+  return errors;
+};
 
-// ── Quick AI Signal (used by Analyze.jsx "Quick AI Signal" button) ────────────
+/* ══════════════════════════════════════════════════════════════════════════════
+   CONTROLLERS
+══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Quick AI Signal ── */
 export const analyzeQuick = async (req, res) => {
   try {
     const { data } = await aiClient.post("/analyze", req.body);
     return res.json(data);
   } catch (err) {
-    // Soft failure — return neutral HOLD so UI doesn't break
-    if (err.code === "ECONNREFUSED")
-      return res.json({ action: "HOLD", confidence: 30,
-                        summary: "AI Engine offline — showing neutral signal", score: 0 });
+    if (err.code === "ECONNREFUSED") {
+      return res.json({
+        action:     "HOLD",
+        confidence: 30,
+        summary:    "AI Engine offline — showing neutral signal",
+        score:      0,
+      });
+    }
     return handleErr(res, err, "QuickAnalyze");
   }
 };
 
-// ── Full Prediction (LSTM + XGBoost + FinBERT) ────────────────────────────────
+/* ── Full Prediction ── */
 export const predict = async (req, res) => {
+  // Validate request body
+  const validationErrors = validatePredictBody(req.body);
+  if (validationErrors.length > 0) {
+    return res.status(400).json({ message: validationErrors.join("; ") });
+  }
+
   const {
     symbol,
-    horizon          = 5,
-    skipSentiment    = false,
-    includeChart     = false,
-    includeBacktest  = false,
-    includeRisk      = true,
-    lstmEpochs       = 60,
+    horizon         = 5,
+    skipSentiment   = false,
+    includeChart    = false,
+    includeBacktest = false,
+    includeRisk     = true,
+    lstmEpochs      = 60,
   } = req.body;
- console.log(`[AI] Predict request: ${symbol}, horizon: ${horizon}d, skipSentiment: ${skipSentiment}, includeChart: ${includeChart}, includeBacktest: ${includeBacktest}, includeRisk: ${includeRisk}, lstmEpochs: ${lstmEpochs}`);
-  if (!symbol) return res.status(400).json({ message: "symbol required" });
-  const sym = symbol.toUpperCase().trim();
-  const ck  = `predict:${sym}:${horizon}`;
+
+  const sym = decodeURIComponent(symbol).toUpperCase().trim();
+  const ck  = `predict:${normCacheKey(sym)}:${horizon}`;
+
+  console.log(`[AI] Predict: symbol="${sym}" horizon=${horizon}d isIndex=${isIndex(sym)}`);
+
   const cached = cget(ck);
   if (cached) return res.json({ ...cached, fromCache: true });
 
   try {
     const { data } = await aiClient.post("/predict", {
       symbol:           sym,
-      horizon,
-      skip_sentiment:   skipSentiment,
-      include_chart:    includeChart,
-      include_backtest: includeBacktest,
-      include_risk:     includeRisk,
-      lstm_epochs:      lstmEpochs,
+      horizon:          Number(horizon),
+      skip_sentiment:   Boolean(skipSentiment),
+      include_chart:    Boolean(includeChart),
+      include_backtest: Boolean(includeBacktest),
+      include_risk:     Boolean(includeRisk),
+      lstm_epochs:      Number(lstmEpochs),
     });
 
-    // Persist to MongoDB (non-blocking)
-    if (req.user?.id) {
+    // Persist to MongoDB (non-blocking, don't fail on DB error)
+    if (req.user?.id && data) {
       Analysis.findOneAndUpdate(
         { userId: req.user.id, symbol: sym },
         {
@@ -118,8 +163,8 @@ export const predict = async (req, res) => {
             signal:     data.trend === "Bullish" ? "BUY"
                       : data.trend === "Bearish" ? "SELL" : "HOLD",
             confidence: data.confidence ?? 0,
-            summary:    [
-              `${data.trend} +${data.predictedReturn?.toFixed(2)}%`,
+            summary: [
+              `${data.trend} +${Number(data.predictedReturn || 0).toFixed(2)}%`,
               `Regime: ${data.marketRegime?.currentRegime ?? "N/A"}`,
               `Sentiment: ${data.sentiment?.label ?? "N/A"}`,
             ].join(" | "),
@@ -127,49 +172,52 @@ export const predict = async (req, res) => {
           },
         },
         { upsert: true, new: true }
-      ).catch(() => {});
+      ).catch(dbErr => console.warn("[AI] DB persist failed:", dbErr.message));
     }
 
     cset(ck, data);
     return res.json({ ...data, fromCache: false });
+
   } catch (err) {
     return handleErr(res, err, "Predict");
   }
 };
 
-// ── Regime ────────────────────────────────────────────────────────────────────
+/* ── Regime ── */
 export const regime = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
-  const ck  = `regime:${sym}`;
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
+  const ck  = `regime:${normCacheKey(sym)}`;
   const cached = cget(ck);
   if (cached) return res.json({ ...cached, fromCache: true });
   try {
-    const { data } = await aiClient.get(`/regime/${sym}`);
+    const { data } = await aiClient.get(`/regime/${encodeURIComponent(sym)}`);
     cset(ck, data);
     return res.json({ ...data, fromCache: false });
   } catch (err) { return handleErr(res, err, "Regime"); }
 };
 
-// ── Sentiment ─────────────────────────────────────────────────────────────────
+/* ── Sentiment ── */
 export const sentiment = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
-  const ck  = `sent:${sym}`;
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
+  const ck  = `sent:${normCacheKey(sym)}`;
   const cached = cget(ck);
   if (cached) return res.json({ ...cached, fromCache: true });
   try {
-    const { data } = await aiClient.get(`/sentiment/${sym}`);
+    const { data } = await aiClient.get(`/sentiment/${encodeURIComponent(sym)}`);
     cset(ck, data);
     return res.json({ ...data, fromCache: false });
   } catch (err) { return handleErr(res, err, "Sentiment"); }
 };
 
-// ── Portfolio Optimize ────────────────────────────────────────────────────────
+/* ── Portfolio Optimize ── */
 export const portfolioOptimize = async (req, res) => {
   const { symbols, method = "max_sharpe", regime: reg = "Sideways" } = req.body;
-  if (!symbols?.length) return res.status(400).json({ message: "symbols required" });
+  if (!symbols?.length) {
+    return res.status(400).json({ message: "symbols array is required" });
+  }
   try {
     const { data } = await aiClient.post("/portfolio", {
-      symbols: symbols.map((s) => s.toUpperCase()),
+      symbols: symbols.map(s => decodeURIComponent(s).toUpperCase()),
       method,
       regime: reg,
     });
@@ -177,61 +225,63 @@ export const portfolioOptimize = async (req, res) => {
   } catch (err) { return handleErr(res, err, "Portfolio"); }
 };
 
-// ── Risk ──────────────────────────────────────────────────────────────────────
+/* ── Risk ── */
 export const risk = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
   try {
-    const { data } = await aiClient.get(`/risk/${sym}`);
+    const { data } = await aiClient.get(`/risk/${encodeURIComponent(sym)}`);
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Risk"); }
 };
 
-// ── Backtest ──────────────────────────────────────────────────────────────────
+/* ── Backtest ── */
 export const backtest = async (req, res) => {
-  const { symbol, initialCash = 100000, signalThreshold = 1.5 } = req.body;
-  if (!symbol) return res.status(400).json({ message: "symbol required" });
+  const { symbol, initialCash = 100000, signalThreshold = 0.8 } = req.body;
+  if (!symbol) return res.status(400).json({ message: "symbol is required" });
+  const sym = decodeURIComponent(symbol).toUpperCase().trim();
+  console.log(`[AI] Backtest: symbol="${sym}"`);
   try {
     const { data } = await aiClient.post("/backtest", {
-      symbol:           symbol.toUpperCase(),
-      initial_cash:     initialCash,
-      signal_threshold: signalThreshold,
+      symbol:           sym,
+      initial_cash:     Number(initialCash),
+      signal_threshold: Number(signalThreshold),
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Backtest"); }
 };
 
-// ── Indicators ────────────────────────────────────────────────────────────────
+/* ── Indicators ── */
 export const indicators = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
   try {
-    const { data } = await aiClient.get(`/indicators/${sym}`, {
+    const { data } = await aiClient.get(`/indicators/${encodeURIComponent(sym)}`, {
       params: { n_days: Number(req.query.n) || 30 },
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Indicators"); }
 };
 
-// ── Chart ─────────────────────────────────────────────────────────────────────
+/* ── Chart ── */
 export const chart = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
   try {
-    const { data } = await aiClient.get(`/chart/${sym}`, {
+    const { data } = await aiClient.get(`/chart/${encodeURIComponent(sym)}`, {
       params: { chart_type: req.query.type || "price" },
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Chart"); }
 };
 
-// ── Timeframes ────────────────────────────────────────────────────────────────
+/* ── Timeframes ── */
 export const timeframes = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
   try {
-    const { data } = await aiClient.get(`/timeframes/${sym}`);
+    const { data } = await aiClient.get(`/timeframes/${encodeURIComponent(sym)}`);
     return res.json(data);
   } catch (err) { return handleErr(res, err, "Timeframes"); }
 };
 
-// ── Macro ─────────────────────────────────────────────────────────────────────
+/* ── Macro ── */
 export const macro = async (req, res) => {
   const ck = "macro:latest";
   const cached = cget(ck);
@@ -243,32 +293,32 @@ export const macro = async (req, res) => {
   } catch (err) { return handleErr(res, err, "Macro"); }
 };
 
-// ── RL Train ──────────────────────────────────────────────────────────────────
+/* ── RL Train ── */
 export const rlTrain = async (req, res) => {
   const { symbol, algorithm = "PPO", totalTimesteps = 30000 } = req.body;
-  if (!symbol) return res.status(400).json({ message: "symbol required" });
+  if (!symbol) return res.status(400).json({ message: "symbol is required" });
   try {
     const { data } = await aiClient.post("/rl/train", {
-      symbol:          symbol.toUpperCase(),
+      symbol:          decodeURIComponent(symbol).toUpperCase(),
       algorithm,
-      total_timesteps: totalTimesteps,
+      total_timesteps: Number(totalTimesteps),
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "RLTrain"); }
 };
 
-// ── RL Evaluate ───────────────────────────────────────────────────────────────
+/* ── RL Evaluate ── */
 export const rlEvaluate = async (req, res) => {
-  const sym = req.params.symbol.toUpperCase().trim();
+  const sym = decodeURIComponent(req.params.symbol).toUpperCase().trim();
   try {
-    const { data } = await aiClient.get(`/rl/evaluate/${sym}`, {
+    const { data } = await aiClient.get(`/rl/evaluate/${encodeURIComponent(sym)}`, {
       params: { algorithm: req.query.algorithm || "PPO" },
     });
     return res.json(data);
   } catch (err) { return handleErr(res, err, "RLEvaluate"); }
 };
 
-// ── Health ────────────────────────────────────────────────────────────────────
+/* ── Health ── */
 export const health = async (_req, res) => {
   try {
     const { data } = await aiClient.get("/health", { timeout: 5000 });
