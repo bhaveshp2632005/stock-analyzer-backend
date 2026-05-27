@@ -14,6 +14,6 @@ import { getIndexData } from "../controllers/indices.controller.js";
 const router = express.Router();
 
 
-router.get("/:symbol(*)", verifyToken, getIndexData);
+router.get("/:symbol", verifyToken, getIndexData);
 
 export default router;
